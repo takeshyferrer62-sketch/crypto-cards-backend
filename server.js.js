@@ -1,66 +1,199 @@
 const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
 const cors = require('cors');
+const { Pool } = require('pg');
 require('dotenv').config();
 
-// Inicializar Bot y Servidor Express
-const bot = new Telegraf(process.env.BOT_TOKEN || 'TU_BOT_TOKEN_AQUI');
+const bot = new Telegraf(process.env.BOT_TOKEN || '7636321016:AAGXKtaWIYgctWO-eF-Hjdxidm6NNITHBZY');
 const app = express();
 
 app.use(express.json());
 app.use(cors());
 
-// Base de datos simulada en memoria (puedes conectarla luego a MongoDB o PostgreSQL)
-let usersDatabase = {
-  // Ejemplo de usuario por su Telegram ID
-  "123456789": {
-    name: "Yunier",
-    cards: [
-      { id: 1, type: 'VISA', number: '4532 •••• •••• 8821', balance: 145.50, expiry: '08/28', status: 'Activa' },
-      { id: 2, type: 'MASTERCARD', number: '5412 •••• •••• 9934', balance: 420.00, expiry: '12/27', status: 'Activa' }
-    ],
-    history: [
-      { id: 1, type: 'Recarga USDT', amount: '+$50.00', date: 'Hace 2 horas' }
-    ]
-  }
-};
-
-// --- RUTA API PARA EL FRONTEND (Vercel) ---
-// La Mini App consultará aquí para obtener las tarjetas reales del usuario de Telegram
-app.get('/api/user/:telegramId', (req, res) => {
-  const { telegramId } = req.params;
-  
-  // Si el usuario no existe en la BD simulada, le creamos una cuenta por defecto
-  if (!usersDatabase[telegramId]) {
-    usersDatabase[telegramId] = {
-      name: "Usuario",
-      cards: [
-        { id: 1, type: 'VISA', number: '4532 •••• •••• 1001', balance: 10.00, expiry: '12/29', status: 'Activa' }
-      ],
-      history: []
-    };
-  }
-  
-  res.json(usersDatabase[telegramId]);
+// Configuración de la Base de Datos PostgreSQL (Supabase / Render)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
-// Endpoint para procesar una orden de recarga cripto
+// Almacén temporal de órdenes de recarga pendientes
+let rechargeOrders = {};
+
+// Función para obtener o crear usuario y sus tarjetas en PostgreSQL
+async function getOrCreateUser(telegramId, firstName = "Usuario") {
+  let userResult = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [telegramId]);
+  
+  if (userResult.rows.length === 0) {
+    // 1. Crear usuario si no existe
+    await pool.query('INSERT INTO users (telegram_id, name) VALUES ($1, $2)', [telegramId, firstName]);
+    
+    // 2. Crear tarjetas por defecto
+    await pool.query(
+      `INSERT INTO cards (telegram_id, type, card_number, balance, expiry, status, gradient) 
+       VALUES ($1, 'VISA', '4532 •••• •••• 8821', 145.50, '08/28', 'Activa', 'linear-gradient(135deg, #1d4ed8 0%, #1e1b4b 100%)'),
+              ($1, 'MASTERCARD', '5412 •••• •••• 9934', 420.00, '12/27', 'Activa', 'linear-gradient(135deg, #dc2626 0%, #18181b 100%)'`,
+      [telegramId]
+    );
+
+    // 3. Crear registro inicial en historial
+    await pool.query(
+      `INSERT INTO history (telegram_id, title, description, amount, date, type) 
+       VALUES ($1, 'Recarga USDT (TRC20)', 'Visa •••• 8821', '+$50.00', 'Hace 2 horas', 'success')`,
+      [telegramId]
+    );
+
+    userResult = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [telegramId]);
+  }
+
+  // Obtener tarjetas e historial actualizados de la BD
+  const cardsResult = await pool.query('SELECT * FROM cards WHERE telegram_id = $1 ORDER BY id ASC', [telegramId]);
+  const historyResult = await pool.query('SELECT * FROM history WHERE telegram_id = $1 ORDER BY id DESC', [telegramId]);
+
+  return {
+    name: userResult.rows[0].name,
+    cards: cardsResult.rows,
+    history: historyResult.rows
+  };
+}
+
+// --- ENDPOINTS DE LA API ---
+
+// 1. Obtener datos del usuario
+app.get('/api/user/:telegramId', async (req, res) => {
+  try {
+    const { telegramId } = req.params;
+    const user = await getOrCreateUser(telegramId);
+    res.json({ success: true, user });
+  } catch (err) {
+    console.error("Error al obtener usuario:", err);
+    res.status(500).json({ success: false, message: "Error en el servidor" });
+  }
+});
+
+// 2. Crear orden de recarga cripto
 app.post('/api/recharge', (req, res) => {
   const { telegramId, cardId, amount, crypto } = req.body;
+  const orderId = 'ORD-' + Math.floor(100000 + Math.random() * 900000);
   
-  // Aquí validarías la transacción en la blockchain o generarías la pasarela
-  console.log(`Orden de recarga recibida: $${amount} USD en ${crypto} para la tarjeta ID ${cardId}`);
-  
-  res.json({ success: true, message: "Orden generada correctamente. Esperando confirmación de red." });
+  const wallets = {
+    "USDT (TRC20)": "TRX_sample_wallet_address_99812",
+    "USDT (TON)": "UQ_ton_sample_address_77431",
+    "TON (Toncoin)": "EQ_toncoin_sample_address_55210",
+    "BTC (Bitcoin)": "bc1_bitcoin_sample_address_33421"
+  };
+
+  rechargeOrders[orderId] = {
+    telegramId,
+    cardId,
+    amount: parseFloat(amount),
+    crypto,
+    status: 'PENDING'
+  };
+
+  res.json({
+    success: true,
+    orderId,
+    address: wallets[crypto] || "EQ_default_wallet_address",
+    message: "Orden generada. Realiza el envío para acreditar el saldo."
+  });
 });
 
-// --- CONFIGURACIÓN DEL BOT DE TELEGRAM ---
+// 3. Confirmar pago y actualizar saldo en PostgreSQL
+app.post('/api/confirm-payment', async (req, res) => {
+  try {
+    const { orderId } = req.body;
+    const order = rechargeOrders[orderId];
+
+    if (!order || order.status === 'COMPLETED') {
+      return res.status(400).json({ success: false, message: "Orden inválida o ya procesada." });
+    }
+
+    order.status = 'COMPLETED';
+
+    // Actualizar saldo de la tarjeta en PostgreSQL
+    await pool.query(
+      'UPDATE cards SET balance = balance + $1 WHERE id = $2 AND telegram_id = $3',
+      [order.amount, order.cardId, order.telegramId]
+    );
+
+    // Obtener tipo de tarjeta para el historial
+    const cardRes = await pool.query('SELECT type FROM cards WHERE id = $1', [order.cardId]);
+    const cardType = cardRes.rows.length > 0 ? cardRes.rows[0].type : 'Tarjeta';
+
+    // Insertar movimiento en la tabla history de PostgreSQL
+    await pool.query(
+      `INSERT INTO history (telegram_id, title, description, amount, date, type) 
+       VALUES ($1, $2, $3, $4, 'Justo ahora', 'success')`,
+      [order.telegramId, `Recarga ${order.crypto}`, `${cardType} ••••`, `+$${order.amount.toFixed(2)}`]
+    );
+
+    // Enviar notificación automática por Telegram
+    try {
+      await bot.telegram.sendMessage(
+        order.telegramId,
+        `✅ *¡Recarga Acreditada con Éxito!*\n\nSe han sumado *$${order.amount.toFixed(2)} USD* a tu tarjeta mediante ${order.crypto}.\n\n💳 Tu saldo ya está actualizado.`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      console.log("No se pudo enviar la notificación de Telegram:", err.message);
+    }
+
+    res.json({ success: true, message: "Pago confirmado y guardado en la base de datos." });
+  } catch (err) {
+    console.error("Error al confirmar pago:", err);
+    res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+});
+
+// 4. Adquirir y guardar nueva tarjeta en PostgreSQL
+app.post('/api/buy-card', async (req, res) => {
+  try {
+    const { telegramId, cardType } = req.body;
+
+    const lastDigits = Math.floor(1000 + Math.random() * 9000);
+    const isVisa = cardType.toLowerCase().includes('visa');
+    const typeName = isVisa ? 'VISA' : 'MASTERCARD';
+    const cardNumber = `${isVisa ? '4532' : '5412'} •••• •••• ${lastDigits}`;
+    const gradient = isVisa ? 'linear-gradient(135deg, #1d4ed8 0%, #1e1b4b 100%)' : 'linear-gradient(135deg, #dc2626 0%, #18181b 100%)';
+
+    // Insertar nueva tarjeta en la base de datos
+    const newCardResult = await pool.query(
+      `INSERT INTO cards (telegram_id, type, card_number, balance, expiry, status, gradient) 
+       VALUES ($1, $2, $3, 0.00, '12/29', 'Activa', $4) RETURNING *`,
+      [telegramId, typeName, cardNumber, gradient]
+    );
+
+    // Registrar en el historial de PostgreSQL
+    await pool.query(
+      `INSERT INTO history (telegram_id, title, description, amount, date, type) 
+       VALUES ($1, $2, 'Nueva tarjeta virtual', '-$0.00', 'Justo ahora', 'info')`,
+      [telegramId, `Emisión de ${typeName}`]
+    );
+
+    // Notificar al usuario por Telegram
+    try {
+      await bot.telegram.sendMessage(
+        telegramId,
+        `🎉 *¡Nueva Tarjeta ${typeName} Emitida!*\n\nTu tarjeta virtual ha sido creada y guardada con éxito en tu cuenta.`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {}
+
+    res.json({ success: true, message: "Tarjeta emitida y guardada en BD", card: newCardResult.rows[0] });
+  } catch (err) {
+    console.error("Error al emitir tarjeta:", err);
+    res.status(500).json({ success: false, message: "Error al guardar tarjeta" });
+  }
+});
+
+// --- COMANDO /START DEL BOT ---
 bot.start((ctx) => {
   const userName = ctx.from.first_name || 'Usuario';
+  getOrCreateUser(ctx.from.id, userName);
   const webAppUrl = process.env.WEB_APP_URL || 'https://tu-mini-app.vercel.app';
 
   ctx.reply(
-    `¡Bienvenido de nuevo, *${userName}*! 💳⚡\n\nGestiona tus tarjetas virtuales Visa y MasterCard y recárgalas al instante con criptomonedas de forma segura.`,
+    `¡Hola, *${userName}*! 💳⚡\n\nTu cuenta está conectada de forma segura a nuestra base de datos en la nube. Abre tu panel para gestionar tus tarjetas:`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
@@ -70,60 +203,8 @@ bot.start((ctx) => {
   );
 });
 
-// Iniciar Bot
 bot.launch();
-console.log('🤖 Bot de Telegram y Backend iniciados correctamente...');
+console.log('🤖 Bot y Base de Datos PostgreSQL sincronizados correctamente...');
 
-// Iniciar servidor Express en el puerto 3000 (o el que asigne la nube)
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🌐 Servidor API corriendo en el puerto ${PORT}`);
-});
-// Almacén temporal de órdenes de recarga pendientes
-let rechargeOrders = [];
-
-// Endpoint para crear una nueva orden de recarga
-app.post('/api/create-recharge', (req, res) => {
-  const { telegramId, cardId, amount, crypto } = req.body;
-  
-  const orderId = 'ORD-' + Math.floor(100000 + Math.random() * 900000);
-  
-  // Direcciones de ejemplo según la cripto seleccionada
-  const walletAddresses = {
-    "USDT (TRC20)": "TRX_sample_wallet_address_99812",
-    "USDT (TON)": "UQ_ton_sample_address_77431",
-    "TON (Toncoin)": "EQ_toncoin_sample_address_55210",
-    "BTC (Bitcoin)": "bc1_bitcoin_sample_address_33421"
-  };
-
-  const newOrder = {
-    orderId,
-    telegramId,
-    cardId,
-    amount,
-    crypto,
-    address: walletAddresses[crypto] || "EQ_default_address",
-    status: "PENDING",
-    createdAt: new Date()
-  };
-
-  rechargeOrders.push(newOrder);
-
-  res.json({
-    success: true,
-    message: "Orden de pago creada correctamente",
-    order: newOrder
-  });
-});
-
-// Endpoint para consultar el estado de una orden (El frontend puede consultarlo cada pocos segundos)
-app.get('/api/check-order/:orderId', (req, res) => {
-  const { orderId } = req.params;
-  const order = rechargeOrders.find(o => o.orderId === orderId);
-  
-  if (!order) {
-    return res.status(404).json({ success: false, message: "Orden no encontrada" });
-  }
-
-  res.json({ success: true, status: order.status });
-});
+app.listen(PORT, () => console.log(`Servidor activo en puerto ${PORT}`));
